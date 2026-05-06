@@ -315,6 +315,20 @@ recursion-unanswered
 ^^^^^^^^^^^^^^^^^^^^
 Number of packets we sent to our recursor, but did not get a timely answer for.
 
+.. _stat-recursing-slot-exhaustion:
+
+recursing-slot-exhaustion
+^^^^^^^^^^^^^^^^^^^^^^^^^
+Number of ALIAS lookups dropped because all DNS Proxy shard slots were in use.
+Increase ``dnsproxy-threads`` or ``dnsproxy-timeout`` if this counter is rising.
+
+.. _stat-recursing-duplicate-replies:
+
+recursing-duplicate-replies
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Number of duplicate replies received from the recursor for the same DNS Proxy slot.
+A persistently rising value may indicate recursor retransmissions or a misconfigured backend.
+
 .. _stat-security-status:
 
 security-status
