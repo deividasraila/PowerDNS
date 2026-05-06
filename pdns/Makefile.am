@@ -1407,6 +1407,7 @@ testrunner_SOURCES = \
 	test-dns_cc.cc \
 	test-dns_random_hh.cc \
 	test-dnsname_cc.cc \
+	test-dnsproxy_cc.cc \
 	test-dnsparser_cc.cc \
 	test-dnsparser_hh.cc \
 	test-dnsrecordcontent.cc \

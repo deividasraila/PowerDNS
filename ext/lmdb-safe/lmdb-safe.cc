@@ -119,6 +119,9 @@ Various other options may also need to be set before opening the handle, e.g. md
 
   mdb_env_set_maxdbs(d_env, 128);
 
+  if (mdb_env_set_maxreaders(d_env, 512))
+    throw std::runtime_error("setting max readers");
+
   // we need MDB_NOTLS since we rely on its semantics
   if(int rc=mdb_env_open(d_env, fname, flags | MDB_NOTLS, mode)) {
     // If this function fails, mdb_env_close() must be called to discard the MDB_env handle.

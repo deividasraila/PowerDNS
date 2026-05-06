@@ -38,6 +38,7 @@
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <cerrno>
+#include <chrono>
 #include <pthread.h>
 #include <thread>
 #include <unistd.h>
@@ -207,6 +208,8 @@ static void declareArguments()
   ::arg().set("queue-limit", "Maximum number of milliseconds to queue a query") = "1500";
   ::arg().set("resolver", "Use this resolver for ALIAS and the internal stub resolver") = "no";
   ::arg().set("dnsproxy-udp-port-range", "Select DNS Proxy outgoing UDP port from given range (lower upper)") = "10000 60000";
+  ::arg().set("dnsproxy-threads", "Number of DNS Proxy shard threads handling ALIAS expansion (0 = match receiver-threads)") = "0";
+  ::arg().set("dnsproxy-timeout", "Milliseconds to wait for a recursor reply before reusing the slot for an ALIAS lookup") = "60000";
   ::arg().set("udp-truncation-threshold", "Maximum UDP response size before we truncate") = "1232";
 
   ::arg().set("config-name", "Name of this virtual configuration - will rename the binary image") = "";
@@ -437,6 +440,8 @@ static void declareStats()
   S.declare("recursion-unanswered", "Number of packets unanswered by configured recursor");
   S.declare("recursing-answers", "Number of recursive answers sent out");
   S.declare("recursing-questions", "Number of questions sent to recursor");
+  S.declare("dnsproxy-slot-exhaustion", "Number of ALIAS lookups dropped because all DNS Proxy shard slots were in use");
+  S.declare("dnsproxy-duplicate-replies", "Number of duplicate recursor replies the DNS Proxy received");
   S.declare("corrupt-packets", "Number of corrupt packets received");
   S.declare("signatures", "Number of DNSSEC signatures made");
   S.declare("tcp-queries", "Number of TCP queries received");
@@ -820,7 +825,15 @@ static void mainthread()
   Utility::dropUserPrivs(newuid);
 
   if (::arg().mustDo("resolver")) {
-    DP = std::make_unique<DNSProxy>(::arg()["resolver"], ::arg()["dnsproxy-udp-port-range"]);
+    unsigned int dnsproxyThreads = ::arg().asNum("dnsproxy-threads");
+    if (dnsproxyThreads == 0) {
+      dnsproxyThreads = std::max(1, ::arg().asNum("receiver-threads", 1));
+    }
+    int dnsproxyTimeout = ::arg().asNum("dnsproxy-timeout");
+    if (dnsproxyTimeout < 1) {
+      dnsproxyTimeout = 1;
+    }
+    DP = std::make_unique<DNSProxy>(slog, ::arg()["resolver"], ::arg()["dnsproxy-udp-port-range"], dnsproxyThreads, std::chrono::milliseconds(dnsproxyTimeout));
     DP->go();
   }
 
