@@ -687,6 +687,40 @@ port range the DNS Proxy's UDP port is chosen from.
 Default should be fine on most installs, but if you have conflicting local
 services, you may choose to limit the range.
 
+.. _setting-dnsproxy-threads:
+
+``dnsproxy-threads``
+--------------------
+
+-  Integer
+-  Default: 0
+
+Number of independent shard threads the DNS Proxy uses to handle ALIAS
+expansion. Each shard owns its own UDP socket to the configured
+:ref:`setting-resolver` and its own connection-tracking table, so traffic
+is distributed across shards without lock contention.
+
+A value of ``0`` (the default) means "match :ref:`setting-receiver-threads`",
+which yields a single shard on stock configurations and scales up
+automatically when the operator has tuned ``receiver-threads``. Set to ``1``
+to force the historical single-thread behaviour. Each shard binds one UDP
+port from :ref:`setting-dnsproxy-udp-port-range`, so the port range must
+contain at least as many ports as shards.
+
+.. _setting-dnsproxy-timeout:
+
+``dnsproxy-timeout``
+--------------------
+
+-  Integer
+-  Default: 60000
+
+Milliseconds the DNS Proxy waits for a recursor reply before declaring an
+ALIAS lookup unanswered. Stale slots are reclaimed by a sweeper that runs
+once per second per shard. Lower this if the configured
+:ref:`setting-resolver` is local and low-latency and you would rather drop
+stale state quickly than hold slots open.
+
 .. _setting-dnssec-key-cache-ttl:
 
 ``dnssec-key-cache-ttl``

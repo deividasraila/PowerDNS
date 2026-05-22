@@ -892,6 +892,7 @@ if get_option('unit-tests')
       src_dir / 'test-dns_cc.cc',
       src_dir / 'test-dns_random_hh.cc',
       src_dir / 'test-dnsname_cc.cc',
+      src_dir / 'test-dnsproxy_cc.cc',
       src_dir / 'test-dnsparser_cc.cc',
       src_dir / 'test-dnsparser_hh.cc',
       src_dir / 'test-dnsrecordcontent.cc',

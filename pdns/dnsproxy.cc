@@ -24,7 +24,8 @@
 #endif
 
 #include <sys/types.h>
-#include <thread>
+#include <sys/time.h>
+#include <cerrno>
 
 #include "packetcache.hh"
 #include "utility.hh"
@@ -44,10 +45,67 @@
 
 extern StatBag S;
 
-DNSProxy::DNSProxy(Logr::log_t slog, const string& remote, const string& udpPortRange) :
-  d_xor(dns_random_uint16())
+namespace
 {
-  d_slog = slog;
+// Open a UDP socket to the recursor: bind to a random port in
+// [portRangeLow, portRangeHigh], then connect() to remote. Throws
+// PDNSException on failure. Sets a 200ms SO_RCVTIMEO so the mainloop
+// can periodically run the stale sweeper and observe the stop flag.
+int openRecursorSocket(const ComboAddress& remote, unsigned long portRangeLow, unsigned long portRangeHigh)
+{
+  int fd = socket(remote.sin4.sin_family, SOCK_DGRAM, 0);
+  if (fd < 0) {
+    throw PDNSException(string("socket: ") + stringerror());
+  }
+
+  ComboAddress local;
+  if (remote.sin4.sin_family == AF_INET) {
+    local = ComboAddress("0.0.0.0");
+  }
+  else {
+    local = ComboAddress("::");
+  }
+
+  unsigned int attempts = 0;
+  for (; attempts < 10; attempts++) {
+    local.sin4.sin_port = htons(portRangeLow + dns_random(portRangeHigh - portRangeLow));
+    if (::bind(fd, reinterpret_cast<struct sockaddr*>(&local), local.getSocklen()) >= 0) { // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+      break;
+    }
+  }
+  if (attempts == 10) {
+    closesocket(fd);
+    throw PDNSException(string("binding dnsproxy socket: ") + stringerror());
+  }
+
+  if (connect(fd, reinterpret_cast<const sockaddr*>(&remote), remote.getSocklen()) < 0) { // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+    int err = errno;
+    closesocket(fd);
+    throw PDNSException("Unable to UDP connect to remote nameserver " + remote.toStringWithPort() + ": " + stringerror(err));
+  }
+
+  struct timeval tv{};
+  tv.tv_sec = 0;
+  tv.tv_usec = 200'000;
+  if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+    int err = errno;
+    closesocket(fd);
+    throw PDNSException(string("setting SO_RCVTIMEO on dnsproxy socket: ") + stringerror(err));
+  }
+
+  return fd;
+}
+}
+
+DNSProxy::DNSProxy(Logr::log_t slog, const string& remote, const string& udpPortRange,
+                   unsigned int numShards, std::chrono::milliseconds timeout) :
+  d_slog(slog),
+  d_timeout(timeout)
+{
+  if (numShards == 0) {
+    throw PDNSException("DNS Proxy requires at least one shard");
+  }
+
   d_resanswers = S.getPointer("recursing-answers");
   d_resquestions = S.getPointer("recursing-questions");
   d_udpanswers = S.getPointer("udp-answers");
@@ -70,47 +128,42 @@ DNSProxy::DNSProxy(Logr::log_t slog, const string& remote, const string& udpPort
     throw PDNSException("DNS Proxy UDP port range upper bound " + std::to_string(portRangeHigh) + " must be higher than lower bound (" + std::to_string(portRangeLow) + ")");
   }
 
-  if ((d_sock = socket(d_remote.sin4.sin_family, SOCK_DGRAM, 0)) < 0) {
-    throw PDNSException(string("socket: ") + stringerror());
-  }
-
-  ComboAddress local;
-  if (d_remote.sin4.sin_family == AF_INET) {
-    local = ComboAddress("0.0.0.0");
-  }
-  else {
-    local = ComboAddress("::");
-  }
-
-  unsigned int attempts = 0;
-  for (; attempts < 10; attempts++) {
-    local.sin4.sin_port = htons(portRangeLow + dns_random(portRangeHigh - portRangeLow));
-
-    if (::bind(d_sock, (struct sockaddr*)&local, local.getSocklen()) >= 0) { // NOLINT(cppcoreguidelines-pro-type-cstyle-cast)
-      break;
+  d_shards.reserve(numShards);
+  for (unsigned int i = 0; i < numShards; ++i) {
+    auto shard = std::make_unique<Shard>();
+    shard->sock = openRecursorSocket(d_remote, portRangeLow, portRangeHigh);
+    shard->xorSeed = dns_random_uint16();
+    {
+      auto hot = shard->hot.lock();
+      initHot(*hot);
     }
-  }
-  if (attempts == 10) {
-    closesocket(d_sock);
-    d_sock = -1;
-    throw PDNSException(string("binding dnsproxy socket: ") + stringerror());
-  }
 
-  if (connect(d_sock, (sockaddr*)&d_remote, d_remote.getSocklen()) < 0) { // NOLINT(cppcoreguidelines-pro-type-cstyle-cast)
-    throw PDNSException("Unable to UDP connect to remote nameserver " + d_remote.toStringWithPort() + ": " + stringerror());
-  }
+    ComboAddress bound;
+    socklen_t boundLen = bound.getSocklen();
+    int boundPort = -1;
+    if (getsockname(shard->sock, reinterpret_cast<struct sockaddr*>(&bound), &boundLen) == 0) { // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+      boundPort = ntohs(bound.sin4.sin_port);
+    }
+    SLOG(g_log << Logger::Error << "DNS Proxy shard " << i << " launched, local port " << boundPort << ", remote " << d_remote.toStringWithPort() << endl,
+         d_slog->info(Logr::Error, "DNS Proxy shard launched", "shard", Logging::Loggable(i), "local port", Logging::Loggable(boundPort), "remote", Logging::Loggable(d_remote.toStringWithPort())));
 
-  SLOG(g_log << Logger::Error << "DNS Proxy launched, local port " << ntohs(local.sin4.sin_port) << ", remote " << d_remote.toStringWithPort() << endl,
-       d_slog->info(Logr::Error, "DNS Proxy launched", "local port", Logging::Loggable(ntohs(local.sin4.sin_port)), "remote", Logging::Loggable(d_remote.toStringWithPort())));
+    d_shards.push_back(std::move(shard));
+  }
+}
+
+DNSProxy::Shard& DNSProxy::pickShard(const DNSName& aname)
+{
+  return *d_shards[aname.hash() % d_shards.size()];
 }
 
 void DNSProxy::go()
 {
-  std::thread proxythread([this]() { mainloop(); });
-  proxythread.detach();
+  for (unsigned int i = 0; i < d_shards.size(); ++i) {
+    Shard& shard = *d_shards[i];
+    shard.loop = std::thread([this, &shard, i]() { mainloop(shard, i); });
+  }
 }
 
-//! look up qname 'target' with reply->qtype, plonk it in the answer section of 'reply' with name 'aname'
 bool DNSProxy::completePacket(std::unique_ptr<DNSPacket>& reply, const DNSName& target, const DNSName& aname, const uint8_t scopeMask)
 {
   string ECSOptionStr;
@@ -167,30 +220,40 @@ bool DNSProxy::completePacket(std::unique_ptr<DNSPacket>& reply, const DNSName& 
     return true;
   }
 
-  uint16_t id;
+  Shard& shard = pickShard(aname);
   uint16_t qtype = reply->qtype.getCode();
-  {
-    auto conntrack = d_conntrack.lock();
-    id = getID_locked(*conntrack);
+  uint16_t id = 0;
 
-    ConntrackEntry ce;
-    ce.id = reply->d.id;
-    ce.remote = reply->d_remote;
-    ce.outsock = reply->getSocket();
-    ce.created = time(nullptr);
-    ce.qtype = reply->qtype.getCode();
-    ce.qname = target;
-    ce.anyLocal = reply->d_anyLocal;
-    ce.complete = std::move(reply);
-    ce.aname = aname;
-    ce.anameScopeMask = scopeMask;
-    (*conntrack)[id] = std::move(ce);
+  {
+    auto hot = shard.hot.lock();
+    if (hot->freeIds.empty()) {
+      shard.slotExhaustion++;
+      S.inc("recursing-slot-exhaustion");
+      SLOG(g_log << Logger::Warning << "DNS Proxy shard exhausted available IDs, dropping ALIAS lookup for " << aname << endl,
+           d_slog->info(Logr::Warning, "DNS Proxy shard exhausted available IDs, dropping ALIAS lookup", "alias", Logging::Loggable(aname)));
+      return false;
+    }
+    id = hot->freeIds.front();
+    hot->freeIds.pop_front();
+
+    Slot& slot = hot->table[id];
+    slot.state = SlotState::IN_USE;
+    slot.created = std::chrono::steady_clock::now();
+    slot.id = reply->d.id;
+    slot.remote = reply->d_remote;
+    slot.outsock = reply->getSocket();
+    slot.qtype = qtype;
+    slot.qname = target;
+    slot.anyLocal = reply->d_anyLocal;
+    slot.aname = aname;
+    slot.anameScopeMask = scopeMask;
+    slot.complete = std::move(reply);
   }
 
   vector<uint8_t> packet;
   DNSPacketWriter pw(packet, target, qtype);
   pw.getHeader()->rd = true;
-  pw.getHeader()->id = id ^ d_xor;
+  pw.getHeader()->id = id ^ shard.xorSeed;
   // Add EDNS Subnet if the client sent one - issue #5469
   if (!ECSOptionStr.empty()) {
     DLOG(SLOG(g_log << "from dnsproxy::completePacket: adding ECS option string to packet options " << makeHexDump(ECSOptionStr) << endl,
@@ -201,56 +264,73 @@ bool DNSProxy::completePacket(std::unique_ptr<DNSPacket>& reply, const DNSName& 
     pw.commit();
   }
 
-  if (send(d_sock, packet.data(), packet.size(), 0) < 0) { // zoom
-    SLOG(g_log << Logger::Error << "Unable to send a packet to our recursing backend: " << stringerror() << endl,
-         d_slog->error(Logr::Error, errno, "Unable to send a packet to our recursing backend"));
+  if (send(shard.sock, packet.data(), packet.size(), 0) < 0) { // zoom
+    int err = errno;
+    SLOG(g_log << Logger::Error << "Unable to send a packet to our recursing backend: " << stringerror(err) << endl,
+         d_slog->error(Logr::Error, err, "Unable to send a packet to our recursing backend"));
+    auto hot = shard.hot.lock();
+    Slot& slot = hot->table[id];
+    if (slot.state == SlotState::IN_USE) {
+      reply = std::move(slot.complete);
+      slot = Slot{};
+      hot->freeIds.push_back(id);
+    }
+    return false;
   }
-
+  (*d_resquestions)++;
   return true;
 }
 
-/** This finds us an unused or stale ID. Does not actually clean the contents */
-int DNSProxy::getID_locked(map_t& conntrack)
+void DNSProxy::sweepStale(Shard& shard)
 {
-  map_t::iterator iter;
-  for (int n = 0;; ++n) { // NOLINT(readability-identifier-length)
-    iter = conntrack.find(n);
-    if (iter == conntrack.end()) {
-      return n;
-    }
-    if (iter->second.created < time(nullptr) - 60) {
-      if (iter->second.created != 0) {
-        SLOG(g_log << Logger::Warning << "Recursive query for remote " << iter->second.remote.toStringWithPort() << " with internal id " << n << " was not answered by backend within timeout, reusing id" << endl,
-             d_slog->info(Logr::Warning, "Recursive query was not answered by backend within timeout, reusing id", "remote", Logging::Loggable(iter->second.remote), "id", Logging::Loggable(n)));
-        iter->second.complete.reset();
-        S.inc("recursion-unanswered");
-      }
-      return n;
+  const auto deadline = std::chrono::steady_clock::now() - d_timeout;
+  auto hot = shard.hot.lock();
+  for (uint32_t i = 0; i < hot->table.size(); ++i) {
+    Slot& slot = hot->table[i];
+    if (slot.state == SlotState::IN_USE && slot.created < deadline) {
+      SLOG(g_log << Logger::Warning << "Recursive query for remote " << slot.remote.toStringWithPort() << " with internal id " << i << " for " << slot.qname << " was not answered by backend within timeout, reusing id" << endl,
+           d_slog->info(Logr::Warning, "Recursive query was not answered by backend within timeout, reusing id", "remote", Logging::Loggable(slot.remote), "id", Logging::Loggable(i),
+     + "qname", Logging::Loggable(slot.qname)));
+      S.inc("recursion-unanswered");
+      shard.staleReaped++;
+      slot = Slot{};
+      hot->freeIds.push_back(static_cast<uint16_t>(i));
     }
   }
 }
 
-void DNSProxy::mainloop()
+void DNSProxy::mainloop(Shard& shard, unsigned int shardIndex)
 {
-  setThreadName("pdns/dnsproxy");
+  setThreadName("pdns/dnsproxy-" + std::to_string(shardIndex));
   try {
     char buffer[1500];
-    ssize_t len;
+    auto lastSweep = std::chrono::steady_clock::now();
 
-    struct msghdr msgh;
-    struct iovec iov;
-    cmsgbuf_aligned cbuf;
-    ComboAddress fromaddr;
-
-    for (;;) {
+    while (!shard.stop.load(std::memory_order_acquire)) {
+      ComboAddress fromaddr;
       socklen_t fromaddrSize = sizeof(fromaddr);
-      len = recvfrom(d_sock, &buffer[0], sizeof(buffer), 0, (struct sockaddr*)&fromaddr, &fromaddrSize); // answer from our backend  NOLINT(cppcoreguidelines-pro-type-cstyle-cast)
-      if (len < (ssize_t)sizeof(dnsheader)) {
-        if (len < 0) {
-          SLOG(g_log << Logger::Error << "Error receiving packet from recursor backend: " << stringerror() << endl,
-               d_slog->error(Logr::Error, errno, "Error receiving packet from recursor backend"));
+      ssize_t len = recvfrom(shard.sock, &buffer[0], sizeof(buffer), 0, reinterpret_cast<struct sockaddr*>(&fromaddr), &fromaddrSize); // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+
+      const auto now = std::chrono::steady_clock::now();
+      if (now - lastSweep >= std::chrono::seconds(1)) {
+        sweepStale(shard);
+        lastSweep = now;
+      }
+
+      if (len < 0) {
+        int err = errno;
+        if (err == EAGAIN || err == EWOULDBLOCK || err == EINTR) {
+          continue; // recv timeout or interrupted: loop and re-check stop/sweep
         }
-        else if (len == 0) {
+        if (shard.stop.load(std::memory_order_acquire)) {
+          break;
+        }
+        SLOG(g_log << Logger::Error << "Error receiving packet from recursor backend: " << stringerror(err) << endl,
+             d_slog->error(Logr::Error, err, "Error receiving packet from recursor backend"));
+        continue;
+      }
+      if (len < static_cast<ssize_t>(sizeof(dnsheader))) {
+        if (len == 0) {
           SLOG(g_log << Logger::Error << "Error receiving packet from recursor backend, EOF" << endl,
                d_slog->info(Logr::Error, "Error receiving packet from recursor backend (EOF)"));
         }
@@ -258,127 +338,151 @@ void DNSProxy::mainloop()
           SLOG(g_log << Logger::Error << "Short packet from recursor backend, " << len << " bytes" << endl,
                d_slog->info(Logr::Error, "Short packet from recursor backend", "length", Logging::Loggable(len)));
         }
-
         continue;
       }
       if (fromaddr != d_remote) {
+        // Defense in depth: kernel filters by 4-tuple via connect(), but
+        // log if anything slips through.
         SLOG(g_log << Logger::Error << "Got answer from unexpected host " << fromaddr.toStringWithPort() << " instead of our recursor backend " << d_remote.toStringWithPort() << endl,
              d_slog->info(Logr::Error, "Got answer from unexpected host instead of our recursor backend", "answer from", Logging::Loggable(fromaddr.toStringWithPort()), "expected", Logging::Loggable(d_remote.toStringWithPort())));
         continue;
       }
       (*d_resanswers)++;
       (*d_udpanswers)++;
+
       dnsheader dHead{};
       memcpy(&dHead, &buffer[0], sizeof(dHead));
+      uint16_t id = dHead.id ^ shard.xorSeed;
+
+      // Critical section: lookup, take ownership of slot contents, free the id.
+      Slot taken;
+      bool ok = false;
       {
-        auto conntrack = d_conntrack.lock();
-
-        auto iter = conntrack->find(dHead.id ^ d_xor);
-        if (iter == conntrack->end()) {
-          SLOG(g_log << Logger::Error << "Discarding untracked packet from recursor backend with id " << (dHead.id ^ d_xor) << ". Conntrack table size=" << conntrack->size() << endl,
-               d_slog->info(Logr::Error, "Discarding untracked packet from recursor backend", "id", Logging::Loggable(dHead.id ^ d_xor), "conntrack table size", Logging::Loggable(conntrack->size())));
-          continue;
+        auto hot = shard.hot.lock();
+        Slot& slot = hot->table[id];
+        if (slot.state == SlotState::FREE) {
+          SLOG(g_log << Logger::Error << "Discarding untracked packet from recursor backend with id " << id << endl,
+               d_slog->info(Logr::Error, "Discarding untracked packet from recursor backend", "id", Logging::Loggable(id)));
         }
-        if (iter->second.created == 0) {
-          SLOG(g_log << Logger::Error << "Received packet from recursor backend with id " << (dHead.id ^ d_xor) << " which is a duplicate" << endl,
-               d_slog->info(Logr::Error, "Discarding received packet from recursor backend with duplicate id", "id", Logging::Loggable(dHead.id ^ d_xor)));
-          continue;
-        }
-
-        dHead.id = iter->second.id;
-        memcpy(&buffer[0], &dHead, sizeof(dHead)); // commit spoofed id
-
-        DNSPacket packet(d_slog, false);
-        packet.parse(&buffer[0], (size_t)len);
-
-        if (packet.qtype.getCode() != iter->second.qtype || packet.qdomain != iter->second.qname) {
-          SLOG(g_log << Logger::Error << "Discarding packet from recursor backend with id " << (dHead.id ^ d_xor) << ", qname or qtype mismatch (" << packet.qtype.getCode() << " v " << iter->second.qtype << ", " << packet.qdomain << " v " << iter->second.qname << ")" << endl,
-               d_slog->info(Logr::Error, "Discarding received packet from recursor backend with name or type mismatch", "id", Logging::Loggable(dHead.id ^ d_xor), "type", Logging::Loggable(packet.qtype), "expected type", Logging::Loggable(iter->second.qtype), "name", Logging::Loggable(packet.qdomain), "expected name", Logging::Loggable(iter->second.qname)));
-          continue;
-        }
-
-        /* Set up iov and msgh structures. */
-        memset(&msgh, 0, sizeof(struct msghdr));
-        string reply; // needs to be alive at time of sendmsg!
-        MOADNSParser mdp(false, packet.getString());
-        // update the EDNS options with info from the resolver - issue #5469
-        // note that this relies on the ECS string encoder to use the source network, and only take the prefix length from scope
-        iter->second.complete->d_eso.setScopePrefixLength(packet.d_eso.getScopePrefixLength());
-        DLOG(SLOG(g_log << "from dnsproxy::mainLoop: updated EDNS options from resolver EDNS source: " << iter->second.complete->d_eso.getSource().toString() << " EDNS scope: " << iter->second.complete->d_eso.getScope().toString() << endl,
-                  d_slog->info(Logr::Debug, "DNSProxy::mainloop: updated EDNS options from resolver EDNS", "source", Logging::Loggable(iter->second.complete->d_eso.getSource()), "scope", Logging::Loggable(iter->second.complete->d_eso.getScope()))));
-
-        if (mdp.d_header.rcode == RCode::NoError) {
-          for (const auto& answer : mdp.d_answers) {
-            if (answer.d_place == DNSResourceRecord::ANSWER || (answer.d_place == DNSResourceRecord::AUTHORITY && answer.d_type == QType::SOA)) {
-
-              if (answer.d_type == iter->second.qtype || (iter->second.qtype == QType::ANY && (answer.d_type == QType::A || answer.d_type == QType::AAAA))) {
-                DNSZoneRecord dzr;
-                dzr.dr.d_name = iter->second.aname;
-                dzr.dr.d_type = answer.d_type;
-                dzr.dr.d_ttl = answer.d_ttl;
-                dzr.dr.d_place = answer.d_place;
-                dzr.dr.setContent(answer.getContent());
-                iter->second.complete->addRecord(std::move(dzr));
-              }
-            }
-          }
-
-          iter->second.complete->setRcode(mdp.d_header.rcode);
+        else if (slot.state == SlotState::RESPONDED) {
+          shard.duplicateReplies++;
+          S.inc("recursing-duplicate-replies");
+          SLOG(g_log << Logger::Error << "Received packet from recursor backend with id " << id << " which is a duplicate" << endl,
+               d_slog->info(Logr::Error, "Discarding received packet from recursor backend with duplicate id", "id", Logging::Loggable(id)));
         }
         else {
-          SLOG(g_log << Logger::Error << "Error resolving for " << iter->second.aname << " ALIAS " << iter->second.qname << " over UDP, " << QType(iter->second.qtype).toString() << "-record query returned " << RCode::to_s(mdp.d_header.rcode) << ", returning SERVFAIL" << endl,
-               d_slog->info(Logr::Error, "Error resolving ALIAS over UDP, returning SERVFAIL", "alias", Logging::Loggable(iter->second.aname), "query", Logging::Loggable(iter->second.qname), "type", Logging::Loggable(iter->second.qtype), "result", Logging::Loggable(RCode::to_s(mdp.d_header.rcode))));
-          iter->second.complete->clearRecords();
-          iter->second.complete->setRcode(RCode::ServFail);
+          taken = std::move(slot);
+          slot = Slot{};
+          slot.state = SlotState::RESPONDED;
+          hot->freeIds.push_back(id);
+          ok = true;
         }
-        reply = iter->second.complete->getString();
-        iov.iov_base = (void*)reply.c_str();
-        iov.iov_len = reply.length();
-        iter->second.complete.reset();
-        msgh.msg_iov = &iov;
-        msgh.msg_iovlen = 1;
-        msgh.msg_name = (struct sockaddr*)&iter->second.remote; // NOLINT(cppcoreguidelines-pro-type-cstyle-cast)
-        msgh.msg_namelen = iter->second.remote.getSocklen();
-        msgh.msg_control = nullptr;
+      }
+      if (!ok) {
+        continue;
+      }
 
-        if (iter->second.anyLocal) {
-          addCMsgSrcAddr(&msgh, &cbuf, iter->second.anyLocal.get_ptr(), 0);
+      // Heavy work: parsing, building reply, sendmsg() — all without the lock.
+      dHead.id = taken.id;
+      memcpy(&buffer[0], &dHead, sizeof(dHead)); // commit spoofed id
+
+      DNSPacket parsed(d_slog, false);
+      parsed.parse(&buffer[0], static_cast<size_t>(len));
+
+      if (parsed.qtype.getCode() != taken.qtype || parsed.qdomain != taken.qname) {
+        SLOG(g_log << Logger::Error << "Discarding packet from recursor backend with id " << id << ", qname or qtype mismatch (" << parsed.qtype.getCode() << " v " << taken.qtype << ", " << parsed.qdomain << " v " << taken.qname << ")" << endl,
+             d_slog->info(Logr::Error, "Discarding received packet from recursor backend with name or type mismatch", "id", Logging::Loggable(id), "type", Logging::Loggable(parsed.qtype), "expected type", Logging::Loggable(taken.qtype), "name", Logging::Loggable(parsed.qdomain), "expected name", Logging::Loggable(taken.qname)));
+        continue;
+      }
+
+      MOADNSParser mdp(false, parsed.getString());
+      // update the EDNS options with info from the resolver - issue #5469
+      // note that this relies on the ECS string encoder to use the source network, and only take the prefix length from scope
+      // Use the more restrictive scope: ALIAS record selection scope vs recursor reply scope.
+      // Prevents resolvers from over-caching geo-targeted responses across subnets.
+      uint8_t effectiveScope = std::max(taken.anameScopeMask,
+          static_cast<uint8_t>(parsed.d_eso.getScopePrefixLength()));
+      taken.complete->d_eso.setScopePrefixLength(effectiveScope);
+      DLOG(SLOG(g_log << "from dnsproxy::mainLoop: updated EDNS options from resolver EDNS source: " << taken.complete->d_eso.getSource().toString() << " EDNS scope: " << taken.complete->d_eso.getScope().toString() << endl,
+                d_slog->info(Logr::Debug, "DNSProxy::mainloop: updated EDNS options from resolver EDNS", "source", Logging::Loggable(taken.complete->d_eso.getSource()), "scope", Logging::Loggable(taken.complete->d_eso.getScope()))));
+
+      if (mdp.d_header.rcode == RCode::NoError) {
+        for (const auto& answer : mdp.d_answers) {
+          if (answer.d_place == DNSResourceRecord::ANSWER || (answer.d_place == DNSResourceRecord::AUTHORITY && answer.d_type == QType::SOA)) {
+            if (answer.d_type == taken.qtype || (taken.qtype == QType::ANY && (answer.d_type == QType::A || answer.d_type == QType::AAAA))) {
+              DNSZoneRecord dzr;
+              dzr.dr.d_name = taken.aname;
+              dzr.dr.d_type = answer.d_type;
+              dzr.dr.d_ttl = answer.d_ttl;
+              dzr.dr.d_place = answer.d_place;
+              dzr.dr.setContent(answer.getContent());
+              taken.complete->addRecord(std::move(dzr));
+            }
+          }
         }
-        if (sendmsg(iter->second.outsock, &msgh, 0) < 0) {
-          int err = errno;
-          SLOG(g_log << Logger::Warning << "dnsproxy.cc: Error sending reply with sendmsg (socket=" << iter->second.outsock << "): " << stringerror(err) << endl,
-               d_slog->error(Logr::Warning, errno, "DNSProxy::mainloop: sendmsg() failed", "socket", Logging::Loggable(iter->second.outsock)));
-        }
-        iter->second.created = 0;
+        taken.complete->setRcode(mdp.d_header.rcode);
+      }
+      else {
+        // SLOG(g_log << Logger::Error << "Error resolving for " << taken.aname << " ALIAS " << taken.qname << " over UDP, " << QType(taken.qtype).toString() << "-record query returned " << RCode::to_s(mdp.d_header.rcode) << ", returning SERVFAIL" << endl,
+        //      d_slog->info(Logr::Error, "Error resolving ALIAS over UDP, returning SERVFAIL", "alias", Logging::Loggable(taken.aname), "query", Logging::Loggable(taken.qname), "type", Logging::Loggable(taken.qtype), "result", Logging::Loggable(RCode::to_s(mdp.d_header.rcode))));
+        taken.complete->clearRecords();
+        taken.complete->setRcode(RCode::ServFail);
+      }
+
+      string reply = taken.complete->getString();
+      struct msghdr msgh{};
+      struct iovec iov{};
+      cmsgbuf_aligned cbuf{};
+      iov.iov_base = const_cast<void*>(static_cast<const void*>(reply.c_str())); // NOLINT(cppcoreguidelines-pro-type-const-cast)
+      iov.iov_len = reply.length();
+      msgh.msg_iov = &iov;
+      msgh.msg_iovlen = 1;
+      msgh.msg_name = reinterpret_cast<struct sockaddr*>(&taken.remote); // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+      msgh.msg_namelen = taken.remote.getSocklen();
+      msgh.msg_control = nullptr;
+      if (taken.anyLocal) {
+        addCMsgSrcAddr(&msgh, &cbuf, taken.anyLocal.get_ptr(), 0);
+      }
+      if (sendmsg(taken.outsock, &msgh, 0) < 0) {
+        int err = errno;
+        SLOG(g_log << Logger::Warning << "dnsproxy.cc: Error sending reply with sendmsg (socket=" << taken.outsock << "): " << stringerror(err) << endl,
+             d_slog->error(Logr::Warning, err, "DNSProxy::mainloop: sendmsg() failed", "socket", Logging::Loggable(taken.outsock)));
       }
     }
   }
   catch (PDNSException& ae) {
-    SLOG(g_log << Logger::Error << "Fatal error in DNS proxy: " << ae.reason << endl,
-         d_slog->error(Logr::Error, ae.reason, "Fatal error in DNS proxy"));
+    SLOG(g_log << Logger::Error << "Fatal error in DNS proxy shard " << shardIndex << ": " << ae.reason << endl,
+         d_slog->error(Logr::Error, ae.reason, "Fatal error in DNS proxy shard", "shard", Logging::Loggable(shardIndex)));
   }
   catch (std::exception& e) {
-    SLOG(g_log << Logger::Error << "DNS Proxy thread died because of STL error: " << e.what() << endl,
-         d_slog->error(Logr::Error, e.what(), "DNS proxy thread died because of STL error"));
+    SLOG(g_log << Logger::Error << "DNS Proxy shard " << shardIndex << " thread died because of STL error: " << e.what() << endl,
+         d_slog->error(Logr::Error, e.what(), "DNS proxy shard thread died because of STL error", "shard", Logging::Loggable(shardIndex)));
   }
   catch (...) {
-    SLOG(g_log << Logger::Error << "Caught unknown exception." << endl,
-         d_slog->info(Logr::Error, "DNS proxy caught an unknown exception"));
+    SLOG(g_log << Logger::Error << "DNS Proxy shard " << shardIndex << " caught an unknown exception" << endl,
+         d_slog->info(Logr::Error, "DNS proxy shard caught an unknown exception", "shard", Logging::Loggable(shardIndex)));
   }
-  SLOG(g_log << Logger::Error << "Exiting because DNS proxy failed" << endl,
-       d_slog->info(Logr::Error, "Exiting because DNS proxy failed"));
-  _exit(1);
 }
 
 DNSProxy::~DNSProxy()
 {
-  if (d_sock > -1) {
-    try {
-      closesocket(d_sock);
-    }
-    catch (const PDNSException& e) {
+  for (auto& shard : d_shards) {
+    shard->stop.store(true, std::memory_order_release);
+    if (shard->sock >= 0) {
+      ::shutdown(shard->sock, SHUT_RD);
     }
   }
-
-  d_sock = -1;
+  for (auto& shard : d_shards) {
+    if (shard->loop.joinable()) {
+      shard->loop.join();
+    }
+    if (shard->sock >= 0) {
+      try {
+        closesocket(shard->sock);
+      }
+      catch (const PDNSException&) {
+      }
+      shard->sock = -1;
+    }
+  }
 }
