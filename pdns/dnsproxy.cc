@@ -288,8 +288,9 @@ void DNSProxy::sweepStale(Shard& shard)
   for (uint32_t i = 0; i < hot->table.size(); ++i) {
     Slot& slot = hot->table[i];
     if (slot.state == SlotState::IN_USE && slot.created < deadline) {
-      SLOG(g_log << Logger::Warning << "Recursive query for remote " << slot.remote.toStringWithPort() << " with internal id " << i << " was not answered by backend within timeout, reusing id" << endl,
-           d_slog->info(Logr::Warning, "Recursive query was not answered by backend within timeout, reusing id", "remote", Logging::Loggable(slot.remote), "id", Logging::Loggable(i)));
+      SLOG(g_log << Logger::Warning << "Recursive query for remote " << slot.remote.toStringWithPort() << " with internal id " << i << " for " << slot.qname << " was not answered by backend within timeout, reusing id" << endl,
+           d_slog->info(Logr::Warning, "Recursive query was not answered by backend within timeout, reusing id", "remote", Logging::Loggable(slot.remote), "id", Logging::Loggable(i),
+     + "qname", Logging::Loggable(slot.qname)));
       S.inc("recursion-unanswered");
       shard.staleReaped++;
       slot = Slot{};
